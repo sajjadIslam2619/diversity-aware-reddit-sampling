@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local scrape cache and Hugging Face model copies
+data/*
+!data/.gitkeep
+models/*
+!models/.gitkeep

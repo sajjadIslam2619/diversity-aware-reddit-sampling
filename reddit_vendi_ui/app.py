@@ -19,12 +19,12 @@ import pandas as pd
 import streamlit as st
 
 from approaches import EMBED_MODEL, EMOTION_MODEL, MENTAL_MODEL
+from paths import DATA_DIR, MODELS_DIR
 from pipeline import posts_for_export, run_pipeline
-from scrape import SIZE_BANDS
+from scrape import SIZE_BANDS, scrape_cache_path
 from storage import list_runs
 
 WORKFLOW_PNG = ROOT.parent / "reddit_data_proces" / "reddit_etl_workflow.png"
-SUGGESTED_K = {20: 4, 50: 7, 100: 14}
 
 st.set_page_config(
     page_title="Reddit Vendi compare",
@@ -93,6 +93,7 @@ def _missing_deps() -> list[str]:
         ("torch", "torch"),
         ("transformers", "transformers"),
         ("sentence_transformers", "sentence-transformers"),
+        ("chromadb", "chromadb"),
     ):
         try:
             __import__(module)
@@ -116,49 +117,92 @@ def _score_cards(v1: float, v2: float, n: int, k_used: int) -> str:
     left = card(
         "a1",
         "Approach 1",
-        "Embed, cluster, similarity",
+        "One post nearest each of k clusters",
         v1,
-        f"Cosine kernel · k={k_used}",
+        f"Cosine Vendi · k={k_used} clusters",
     )
     right = card(
         "a2",
         "Approach 2",
-        "Mental status, emotion, post size",
+        "Size × mental status × emotion coverage",
         v2,
-        "Category-match kernel",
+        "Cosine Vendi on the selected set",
     )
     return f'<div class="score-grid">{left}{right}</div>'
 
 
+def _posts_table(posts: pd.DataFrame) -> None:
+    show_cols = [
+        col
+        for col in (
+            "created_utc",
+            "title",
+            "post_author",
+            "score",
+            "post_word_count",
+            "post_size_category",
+            "mental_health_class",
+            "post_emotion",
+            "cluster",
+            "permalink",
+        )
+        if col in posts.columns
+    ]
+    if "permalink" not in posts.columns and "url" in posts.columns:
+        show_cols.append("url")
+    show = posts[show_cols].rename(
+        columns={
+            "created_utc": "created",
+            "post_author": "author",
+            "post_word_count": "words",
+            "post_size_category": "size",
+            "mental_health_class": "mental status",
+            "post_emotion": "emotion",
+            "permalink": "post",
+        }
+    )
+    link_col = "post" if "post" in show.columns else "url"
+    st.dataframe(
+        show,
+        use_container_width=True,
+        hide_index=True,
+        column_config={link_col: st.column_config.LinkColumn("post")} if link_col in show.columns else None,
+    )
+
+
 def _render_results(result: dict) -> None:
     summary = result["summary"]
-    posts = result["posts"]
-    n = int(summary["n_scraped"])
+    posts_a1 = result.get("posts_a1", result["posts"])
+    posts_a2 = result.get("posts_a2", result["posts"])
+    corpus = result.get("corpus")
+    n_corpus = int(summary["n_scraped"])
+    n1 = int(summary.get("n_selected_a1") or len(posts_a1))
+    n2 = int(summary.get("n_selected_a2") or len(posts_a2))
+    n_score = max(n1, n2)
     v1 = float(summary["vendi_approach1"])
     v2 = float(summary["vendi_approach2"])
 
     st.markdown(
-        _score_cards(v1, v2, n, int(summary["k_used"])),
+        _score_cards(v1, v2, n_score, int(summary["k_used"])),
         unsafe_allow_html=True,
     )
 
     gap = v1 - v2
     if abs(gap) < 0.05:
-        compare = "The two kernels see about the same diversity in this selection."
+        compare = "The two selected sets are about equally diverse under cosine Vendi."
     elif gap > 0:
-        compare = (
-            "Approach 1’s embedding kernel sees more diversity than Approach 2’s "
-            "size / mental-status / emotion labels."
-        )
+        compare = "Approach 1’s cluster sample is more diverse (higher cosine Vendi)."
     else:
-        compare = (
-            "Approach 2’s label kernel sees more diversity than Approach 1’s "
-            "embedding kernel."
-        )
+        compare = "Approach 2’s label-coverage sample is more diverse (higher cosine Vendi)."
+    cache_note = (
+        " Reused corpus from data/."
+        if summary.get("posts_from_cache")
+        else " Fresh scrape saved to data/."
+    )
     st.caption(
         f"r/{summary['subreddit']} · {summary['listing']} · "
-        f"{n} of {summary['n_requested']} posts · run #{summary['run_id']}. {compare} "
-        "Both scores are effective sample sizes from 1 (all alike) to N (mutually dissimilar)."
+        f"corpus {n_corpus} posts · selected {n1} vs {n2} · run #{summary['run_id']}.{cache_note} {compare} "
+        "Both scores use the same cosine Vendi on selftext embeddings of the selected posts."
     )
 
     chart = pd.DataFrame(
@@ -168,93 +212,75 @@ def _render_results(result: dict) -> None:
     st.bar_chart(chart, height=220)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Mean cosine similarity", f"{summary['mean_sim_approach1']:.3f}")
-    c2.metric("Mean label overlap", f"{summary['mean_sim_approach2']:.3f}")
-    c3.metric("Clusters used", str(summary["k_used"]))
-    c4.metric("Embedding dim", str(summary["embedding_dim"]))
+    c1.metric("Corpus posts", str(n_corpus))
+    c2.metric("Mean cosine (A1 sample)", f"{summary['mean_sim_approach1']:.3f}")
+    c3.metric("Mean cosine (A2 sample)", f"{summary['mean_sim_approach2']:.3f}")
+    c4.metric("Clusters k", str(summary["k_used"]))
 
-    tabs = st.tabs(["Posts", "Approach 1", "Approach 2", "Run details"])
+    tabs = st.tabs(["Approach 1 sample", "Approach 2 sample", "Corpus", "Run details"])
     with tabs[0]:
-        show = posts[
-            [
-                "created_utc",
-                "title",
-                "score",
-                "post_word_count",
-                "post_size_category",
-                "mental_health_class",
-                "post_emotion",
-                "cluster",
-                "url",
-            ]
-        ].rename(
-            columns={
-                "created_utc": "created",
-                "post_word_count": "words",
-                "post_size_category": "size",
-                "mental_health_class": "mental status",
-                "post_emotion": "emotion",
-            }
-        )
-        st.dataframe(
-            show,
-            use_container_width=True,
-            hide_index=True,
-            column_config={"url": st.column_config.LinkColumn("post")},
-        )
-        export = posts_for_export(posts)
+        st.write("One post nearest each cluster centroid")
+        _posts_table(posts_a1)
+        st.dataframe(result["cluster_counts"], use_container_width=True, hide_index=True)
+        st.write("Cosine similarity of cluster centers")
+        st.dataframe(result["centroid_similarity"].round(3), use_container_width=True)
         st.download_button(
-            "Download posts CSV",
-            data=export.to_csv(index=False).encode("utf-8"),
-            file_name=f"r_{summary['subreddit']}_{n}_vendi.csv",
+            "Download Approach 1 sample",
+            data=posts_for_export(posts_a1).to_csv(index=False).encode("utf-8"),
+            file_name=f"r_{summary['subreddit']}_a1_k{summary['k_used']}.csv",
             mime="text/csv",
+            key="dl-a1",
         )
 
     with tabs[1]:
-        st.write("Posts per cluster")
-        st.dataframe(result["cluster_counts"], use_container_width=True, hide_index=True)
-        st.write("Cosine similarity of cluster centers")
-        sim = result["centroid_similarity"].round(3)
-        st.dataframe(sim, use_container_width=True)
-        examples = (
-            posts.groupby("cluster", sort=True)["title"]
-            .first()
-            .rename("example title")
-            .reset_index()
-        )
-        st.write("Example title from each cluster")
-        st.dataframe(examples, use_container_width=True, hide_index=True)
-
-    with tabs[2]:
+        st.write("Posts spread across size × mental status × emotion")
+        _posts_table(posts_a2)
         left, right = st.columns(2)
         with left:
             st.write("Post size")
             st.dataframe(
-                posts["post_size_category"].value_counts().rename_axis("size").reset_index(name="posts"),
+                posts_a2["post_size_category"].value_counts().rename_axis("size").reset_index(name="posts"),
                 hide_index=True,
                 use_container_width=True,
             )
             st.write("Mental status")
             st.dataframe(
-                posts["mental_health_class"].value_counts().rename_axis("mental status").reset_index(name="posts"),
+                posts_a2["mental_health_class"].value_counts().rename_axis("mental status").reset_index(name="posts"),
                 hide_index=True,
                 use_container_width=True,
             )
         with right:
             st.write("Emotion")
             st.dataframe(
-                posts["post_emotion"].value_counts().rename_axis("emotion").reset_index(name="posts"),
+                posts_a2["post_emotion"].value_counts().rename_axis("emotion").reset_index(name="posts"),
                 hide_index=True,
                 use_container_width=True,
             )
         st.write("Size × mental status")
-        cross = pd.crosstab(posts["post_size_category"], posts["mental_health_class"])
-        st.dataframe(cross, use_container_width=True)
-        out_of_band = int((posts["post_size_category"] == "out_of_band").sum())
-        if out_of_band:
-            st.info(
-                f"{out_of_band} posts are outside the 10–500 word bands "
-                "(labeled out_of_band). They stay in the Vendi score so both approaches use the same posts."
+        st.dataframe(
+            pd.crosstab(posts_a2["post_size_category"], posts_a2["mental_health_class"]),
+            use_container_width=True,
+        )
+        st.download_button(
+            "Download Approach 2 sample",
+            data=posts_for_export(posts_a2).to_csv(index=False).encode("utf-8"),
+            file_name=f"r_{summary['subreddit']}_a2_n{n2}.csv",
+            mime="text/csv",
+            key="dl-a2",
+        )
+
+    with tabs[2]:
+        if corpus is None or corpus.empty:
+            st.info("Corpus table was not returned for this run.")
+        else:
+            st.write(f"Full scraped listing ({len(corpus)} posts)")
+            _posts_table(corpus)
+            st.download_button(
+                "Download corpus CSV",
+                data=posts_for_export(corpus).to_csv(index=False).encode("utf-8"),
+                file_name=f"r_{summary['subreddit']}_corpus.csv",
+                mime="text/csv",
+                key="dl-corpus",
             )
 
     with tabs[3]:
@@ -264,11 +290,20 @@ def _render_results(result: dict) -> None:
                 "subreddit": summary["subreddit"],
                 "listing": summary["listing"],
                 "time_filter": summary.get("time_filter") or "—",
+                "corpus_posts": n_corpus,
+                "selected": {"approach1": n1, "approach2": n2},
+                "label_groups": summary.get("n_label_groups"),
                 "models": {
                     "embed": summary["embed_model"],
                     "mental": summary["mental_model"],
                     "emotion": summary["emotion_model"],
+                    "folder": str(MODELS_DIR),
                 },
+                "data_file": summary.get("data_file") or str(DATA_DIR),
+                "sample_a1_file": summary.get("sample_a1_file"),
+                "sample_a2_file": summary.get("sample_a2_file"),
+                "chroma": summary.get("chroma_dir"),
+                "posts_from_cache": bool(summary.get("posts_from_cache")),
                 "seconds": {key: round(value, 1) for key, value in timings.items()},
                 "sqlite": "reddit_vendi_ui/output/runs.sqlite",
             }
@@ -279,15 +314,15 @@ with st.sidebar:
     st.header("How scoring works")
     st.markdown(
         """
-**Approach 1** embeds each post, clusters those vectors, and scores diversity with a cosine-similarity Vendi score.
+**Approach 1** embeds the full corpus (ChromaDB), clusters into k=20/50/100, and keeps one post nearest each centroid.
 
-**Approach 2** labels mental status, emotion, and post size, then scores diversity with a category-match Vendi score.
+**Approach 2** labels every post (mental status, emotion, size) and picks 20/50/100 posts that cover those label combinations.
 
-Same scraped posts. Different similarity. Higher score means more dissimilar posts.
+Vendi then scores the two selected sets in the same embedding space. Higher means the sample is more diverse.
         """
     )
     bands = ", ".join(f"{name} {low}–{high}" for name, low, high in SIZE_BANDS)
-    st.caption(f"Size bands: {bands} words (title + body). Outside that range is out_of_band.")
+    st.caption(f"Size bands: {bands} words (selftext). Outside that range is out_of_band.")
     history = list_runs()
     if not history.empty:
         st.subheader("Recent runs")
@@ -296,7 +331,7 @@ Same scraped posts. Different similarity. Higher score means more dissimilar pos
                 columns={
                     "vendi_approach1": "Vendi 1",
                     "vendi_approach2": "Vendi 2",
-                    "n_scraped": "posts",
+                    "n_scraped": "corpus",
                     "k_used": "k",
                 }
             ),
@@ -308,7 +343,7 @@ st.markdown(
     """
     <div class="hero">
       <h1>Reddit diversity compare</h1>
-      <p>Scrape a subreddit, then score the same posts with both pipelines.</p>
+      <p>Scrape a subreddit, sample diverse posts two ways, then compare those samples with Vendi.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -331,10 +366,11 @@ with controls:
         help="Name, r/name, or a reddit.com/r/name URL.",
     )
     n_posts = st.radio(
-        "How many posts",
+        "Sample size / Approach 1 clusters (k)",
         [20, 50, 100],
         horizontal=True,
         index=0,
+        help="Approach 1 uses this as the number of clusters (one post per cluster). Approach 2 selects this many posts across labels.",
     )
     listing = st.selectbox(
         "Listing",
@@ -352,28 +388,31 @@ with controls:
             ["day", "week", "month", "year", "all"],
             index=2,
         )
-    k = st.number_input(
-        "Approach 1 clusters (k)",
-        min_value=2,
-        max_value=int(n_posts),
-        value=SUGGESTED_K[int(n_posts)],
-        step=1,
-        key=f"k-{n_posts}",
-        help="Suggested k keeps clusters from getting tiny. The notebooks used k=14 on a much larger corpus.",
+    force_scrape = st.checkbox(
+        "Re-scrape even if data/ already has this listing",
+        value=False,
+        help="Leave unchecked to reuse the saved corpus in data/ and embeddings in data/chroma.",
     )
-    run_clicked = st.button("Scrape and compare", type="primary")
+    run_clicked = st.button("Scrape corpus and sample", type="primary")
 
 with notes:
+    cache_hint = ""
+    try:
+        cache_file = scrape_cache_path(subreddit, listing, time_filter)
+        if cache_file.is_file():
+            cache_hint = f" Cached posts: `data/{cache_file.name}`."
+    except Exception:
+        cache_hint = ""
     st.markdown(
         f"""
 **Fixed from the existing notebooks**
 
-- Embeddings: `{EMBED_MODEL}`
-- Mental status: `{MENTAL_MODEL}`
-- Emotion: `{EMOTION_MODEL}`
-- Best comment stored with the post; authors are not saved
+- Embeddings: `{EMBED_MODEL}` on `selftext`, stored in ChromaDB under `data/chroma`
+- Mental status: `{MENTAL_MODEL}` on `selftext`
+- Emotion: `{EMOTION_MODEL}` on `selftext`
+- Top 3 comments saved as `comment-body-1` / `comment-body-score-1`, then 2 and 3
 
-The first run downloads the models. On CPU, 50–100 posts can take several minutes.
+The app scrapes the full listing (Reddit usually caps near 1000), then selects k posts two ways. Corpus, samples, and models are reused from `data/` and `models/` when present.{cache_hint}
 Credentials are read from the repo `.env`. This package does not change the notebooks.
         """
     )
@@ -386,11 +425,11 @@ if run_clicked:
 
             result = run_pipeline(
                 subreddit=subreddit,
-                n_posts=int(n_posts),
-                k=int(k),
+                n_select=int(n_posts),
                 listing=listing,
                 time_filter=time_filter,
                 progress=_progress,
+                use_cache=not force_scrape,
             )
             status.update(label="Scores ready", state="complete", expanded=False)
         st.session_state["result"] = result
@@ -403,14 +442,18 @@ if run_clicked:
 
 result = st.session_state.get("result")
 if result:
-    if int(result["summary"]["n_scraped"]) < int(result["summary"]["n_requested"]):
+    selected = max(
+        int(result["summary"].get("n_selected_a1") or 0),
+        int(result["summary"].get("n_selected_a2") or 0),
+    )
+    if selected < int(result["summary"]["n_requested"]):
         st.warning(
-            f"Reddit returned {result['summary']['n_scraped']} usable posts, "
-            f"fewer than the {result['summary']['n_requested']} requested. "
-            "Scores use the posts that were returned."
+            f"The corpus has {result['summary']['n_scraped']} usable posts, "
+            f"fewer than the {result['summary']['n_requested']} requested, "
+            "so both samples use every post Reddit returned."
         )
     _render_results(result)
 elif WORKFLOW_PNG.is_file():
     st.image(str(WORKFLOW_PNG), caption="Both approaches run on the same scraped posts.")
 else:
-    st.info("Choose a subreddit and how many posts, then scrape.")
+    st.info("Choose a subreddit, then scrape the corpus and sample.")

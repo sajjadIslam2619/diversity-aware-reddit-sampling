@@ -94,14 +94,14 @@ def save_run(summary: dict, posts: pd.DataFrame) -> int:
                     rec.get("title"),
                     rec.get("selftext"),
                     rec.get("score"),
-                    rec.get("url"),
+                    rec.get("url") or rec.get("permalink"),
                     rec.get("created_utc"),
                     rec.get("post_word_count"),
                     rec.get("post_size_category"),
                     rec.get("mental_health_class"),
                     rec.get("post_emotion"),
                     rec.get("cluster"),
-                    rec.get("comment_body"),
+                    rec.get("comment-body-1") or rec.get("comment_body"),
                     rec.get("data_source"),
                 )
             )

@@ -1,17 +1,19 @@
-pip install requests
-pip install pandas
-pip install openpyxl
-pip install praw
-pip install scikit-learn
-pip install transformers tqdm
-##To install torch check the following link for the correct version for your GPU
-#https://pytorch.org/get-started/locally/
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install seaborn
-pip install umap-learn
-pip install hdbscan
-pip install -U sentence-transformers
-pip install statsmodels
-pip install ipywidgets
-pip install captum
-pip install keybert
+# For GPU PyTorch, use: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# See https://pytorch.org/get-started/locally/
+requests
+pandas
+openpyxl
+praw
+scikit-learn
+transformers
+tqdm
+torch
+torchvision
+seaborn
+umap-learn
+hdbscan
+sentence-transformers
+statsmodels
+ipywidgets
+captum
+keybert
