@@ -16,11 +16,6 @@ def ensure_dirs() -> None:
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def model_dirname(repo_id: str) -> str:
     return repo_id.strip().replace("/", "--")
 

@@ -1,4 +1,4 @@
-"""Approach 1 (embed, cluster, similarity) and Approach 2 (mental, emotion, size)."""
+"""Cluster centroids (embed, cluster) and label coverage (mental, emotion, size)."""
 
 from __future__ import annotations
 
@@ -31,6 +31,57 @@ def _token() -> str | None:
     return token or None
 
 
+_used_devices: dict[str, str] = {}
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower()
+
+
+def _record_device(step: str, using: str) -> None:
+    _used_devices[step] = using
+
+
+def reset_used_devices() -> None:
+    _used_devices.clear()
+
+
+def used_devices() -> dict[str, str]:
+    return dict(_used_devices)
+
+
+def compute_status() -> dict:
+    """What the models will use unless a run falls back to CPU."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            return {
+                "using": "GPU",
+                "cuda": True,
+                "name": name,
+                "caption": f"GPU ({name})",
+            }
+    except Exception:
+        pass
+    return {
+        "using": "CPU",
+        "cuda": False,
+        "name": "",
+        "caption": "CPU (CUDA not available)",
+    }
+
+
 def _release(*objs) -> None:
     for obj in objs:
         del obj
@@ -42,6 +93,15 @@ def _release(*objs) -> None:
             torch.cuda.empty_cache()
     except Exception:
         return
+
+
+def _sentence_transformer(local_model: str, device: str):
+    from sentence_transformers import SentenceTransformer
+
+    try:
+        return SentenceTransformer(local_model, local_files_only=True, device=device)
+    except TypeError:
+        return SentenceTransformer(local_model, device=device)
 
 
 def _is_local_model(path: Path) -> bool:
@@ -88,11 +148,10 @@ def resolve_local_model(repo_id: str, progress: Progress, label: str) -> str:
 
 
 def _classify(texts: list[str], model_name: str, progress: Progress, label: str) -> list[str]:
-    import torch
     from transformers import pipeline
 
     local_model = resolve_local_model(model_name, progress, label)
-    device = 0 if torch.cuda.is_available() else -1
+    device = 0 if _cuda_available() else -1
     kwargs = {
         "model": local_model,
         "tokenizer": local_model,
@@ -108,6 +167,9 @@ def _classify(texts: list[str], model_name: str, progress: Progress, label: str)
             clf = pipeline("text-classification", **kwargs)
         else:
             raise
+    using = "GPU" if kwargs["device"] == 0 else "CPU"
+    _record_device(label, using)
+    progress(f"{label} on {using}…")
 
     preds: list[str] = []
     batch_size = 8
@@ -117,11 +179,13 @@ def _classify(texts: list[str], model_name: str, progress: Progress, label: str)
             try:
                 out = clf(batch, batch_size=batch_size)
             except RuntimeError as exc:
-                if "out of memory" not in str(exc).lower() or kwargs.get("device") == -1:
+                if not _is_cuda_oom(exc) or kwargs.get("device") == -1:
                     raise
                 _release(clf)
                 kwargs["device"] = -1
                 clf = pipeline("text-classification", **kwargs)
+                _record_device(label, "CPU")
+                progress(f"{label} GPU out of memory; retrying on CPU…")
                 out = clf(batch, batch_size=batch_size)
             preds.extend(item["label"] for item in out)
             progress(f"{label}: {min(start + batch_size, len(texts))} / {len(texts)}")
@@ -144,24 +208,54 @@ def _selftexts(frame: pd.DataFrame) -> list[str]:
 def encode_texts(texts: list[str], progress: Progress | None = None) -> np.ndarray:
     progress = progress or _noop
     local_model = resolve_local_model(EMBED_MODEL, progress, "embedding")
-    from sentence_transformers import SentenceTransformer
-
+    device = "cuda" if _cuda_available() else "cpu"
     try:
-        model = SentenceTransformer(local_model, local_files_only=True)
-    except TypeError:
-        model = SentenceTransformer(local_model)
+        model = _sentence_transformer(local_model, device)
+    except Exception:
+        if device == "cpu":
+            raise
+        device = "cpu"
+        model = _sentence_transformer(local_model, device)
+    using = "GPU" if device == "cuda" else "CPU"
+    _record_device("embedding", using)
+    progress(f"Embedding on {using}…")
 
     chunks = []
     batch_size = 8
     n = len(texts)
     try:
         for start in range(0, n, batch_size):
-            chunk = model.encode(
-                texts[start : start + batch_size],
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                batch_size=batch_size,
-            )
+            batch = texts[start : start + batch_size]
+            try:
+                try:
+                    chunk = model.encode(
+                        batch,
+                        show_progress_bar=False,
+                        convert_to_numpy=True,
+                        batch_size=batch_size,
+                        device=device,
+                    )
+                except TypeError:
+                    chunk = model.encode(
+                        batch,
+                        show_progress_bar=False,
+                        convert_to_numpy=True,
+                        batch_size=batch_size,
+                    )
+            except RuntimeError as exc:
+                if not _is_cuda_oom(exc) or device == "cpu":
+                    raise
+                _release(model)
+                device = "cpu"
+                model = _sentence_transformer(local_model, device)
+                _record_device("embedding", "CPU")
+                progress("Embedding GPU out of memory; retrying on CPU…")
+                chunk = model.encode(
+                    batch,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    batch_size=batch_size,
+                )
             chunks.append(np.asarray(chunk))
             progress(f"Embedding posts: {min(start + batch_size, n)} / {n}")
         return np.vstack(chunks)
@@ -212,11 +306,11 @@ def sample_approach_1(
     k: int,
     progress: Progress | None = None,
 ) -> dict:
-    """k clusters on the full corpus; one post nearest each centroid (k diverse posts)."""
+    """n clusters on the full corpus; keep the post nearest each centroid (n posts)."""
     progress = progress or _noop
     n = len(frame)
     if n < 2:
-        raise RuntimeError("Approach 1 needs at least 2 posts.")
+        raise RuntimeError("Cluster centroids needs at least 2 posts.")
     vectors = np.asarray(embeddings, dtype=np.float64)
     if vectors.shape[0] != n:
         raise RuntimeError("Embedding rows do not match the corpus.")
@@ -224,7 +318,7 @@ def sample_approach_1(
     rounded = np.round(vectors, 5)
     n_unique = int(np.unique(rounded, axis=0).shape[0])
     k_used = int(max(1, min(int(k), n, n_unique)))
-    progress(f"Approach 1: clustering corpus into k={k_used}…")
+    progress(f"Cluster centroids: clustering into {k_used} groups and taking each centroid post…")
     if k_used < 2:
         labels = np.zeros(n, dtype=int)
         centers = vectors.mean(axis=0, keepdims=True)
@@ -244,6 +338,7 @@ def sample_approach_1(
     scored = frame.copy()
     scored["cluster"] = assigned
     selected = scored.iloc[picked].copy().reset_index(drop=True)
+    selected["selection_role"] = "cluster_centroid"
     selected_vectors = vectors[picked]
     center_sim = cosine_similarity(centers)
     center_df = pd.DataFrame(center_sim, index=cluster_names, columns=cluster_names)
@@ -255,6 +350,14 @@ def sample_approach_1(
         .reset_index(name="post_count")
     )
     kernel = cosine_kernel(selected_vectors)
+    score = float(vendi_score(kernel))
+    mean_sim = mean_off_diagonal(kernel)
+    try:
+        mean_sim = float(mean_sim)
+        if mean_sim != mean_sim:
+            mean_sim = None
+    except (TypeError, ValueError):
+        mean_sim = None
     return {
         "corpus": scored,
         "posts": selected,
@@ -262,8 +365,8 @@ def sample_approach_1(
         "k_requested": int(k),
         "k_used": k_used,
         "embedding_dim": int(vectors.shape[1]),
-        "vendi": vendi_score(kernel),
-        "mean_similarity": mean_off_diagonal(kernel),
+        "vendi": score,
+        "mean_similarity": mean_sim,
         "cluster_counts": counts,
         "centroid_similarity": center_df,
         "model": EMBED_MODEL,
@@ -279,9 +382,9 @@ def sample_approach_2(
     """n posts covering as many size × mental × emotion combinations as possible."""
     progress = progress or _noop
     if len(frame) < 2:
-        raise RuntimeError("Approach 2 needs at least 2 posts.")
+        raise RuntimeError("Label coverage needs at least 2 posts.")
     n_used = int(max(1, min(int(n), len(frame))))
-    progress(f"Approach 2: selecting {n_used} posts across size / mental / emotion groups…")
+    progress(f"Label coverage: selecting {n_used} posts across size / mental / emotion groups…")
 
     group_cols = ["size_category", "mental_status_category", "emotion_category"]
     working = frame.reset_index(drop=True)
@@ -320,14 +423,22 @@ def sample_approach_2(
         selected_vectors = np.asarray(embeddings, dtype=np.float64)[selected_idx]
         kernel = cosine_kernel(selected_vectors)
 
+    score = float(vendi_score(kernel))
+    mean_sim = mean_off_diagonal(kernel)
+    try:
+        mean_sim = float(mean_sim)
+        if mean_sim != mean_sim:
+            mean_sim = None
+    except (TypeError, ValueError):
+        mean_sim = None
     return {
         "posts": selected,
         "embeddings": selected_vectors,
         "n_requested": int(n),
         "n_selected": len(selected),
         "n_label_groups": len(buckets),
-        "vendi": vendi_score(kernel),
-        "mean_similarity": mean_off_diagonal(kernel),
+        "vendi": score,
+        "mean_similarity": mean_sim,
         "mental_model": MENTAL_MODEL,
         "emotion_model": EMOTION_MODEL,
     }

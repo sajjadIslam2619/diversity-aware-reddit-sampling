@@ -58,6 +58,18 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _sql_real(value):
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
 def save_run(summary: dict, posts: pd.DataFrame) -> int:
     conn = _connect()
     try:
@@ -76,12 +88,12 @@ def save_run(summary: dict, posts: pd.DataFrame) -> int:
                 summary.get("time_filter") or "",
                 int(summary["n_requested"]),
                 int(summary["n_scraped"]),
-                int(summary["k_requested"]),
-                int(summary["k_used"]),
-                float(summary["vendi_approach1"]),
-                float(summary["vendi_approach2"]),
-                float(summary["mean_sim_approach1"]),
-                float(summary["mean_sim_approach2"]),
+                int(summary.get("k_requested") or summary["n_requested"]),
+                int(summary.get("k_used") or summary["n_requested"]),
+                _sql_real(summary.get("vendi_approach1")),
+                _sql_real(summary.get("vendi_approach2")),
+                _sql_real(summary.get("mean_sim_approach1")),
+                _sql_real(summary.get("mean_sim_approach2")),
             ),
         )
         run_id = int(cur.lastrowid)
@@ -126,7 +138,7 @@ def list_runs(limit: int = 8) -> pd.DataFrame:
         return pd.DataFrame()
     conn = _connect()
     try:
-        return pd.read_sql_query(
+        frame = pd.read_sql_query(
             """
             SELECT id, created_at, subreddit, listing, n_scraped,
                    k_used, vendi_approach1, vendi_approach2
@@ -137,5 +149,9 @@ def list_runs(limit: int = 8) -> pd.DataFrame:
             conn,
             params=(int(limit),),
         )
+        for col in ("vendi_approach1", "vendi_approach2"):
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame
     finally:
         conn.close()

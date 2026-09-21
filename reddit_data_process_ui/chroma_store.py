@@ -14,8 +14,8 @@ Progress = Callable[[str], None]
 EncodeFn = Callable[[list[str], Progress], np.ndarray]
 
 
-def _collection_name(subreddit: str, listing: str) -> str:
-    raw = f"r_{subreddit}_{listing}_selftext"
+def _collection_name(subreddit: str) -> str:
+    raw = f"r_{subreddit}_selftext"
     cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", raw)
     if len(cleaned) < 3:
         cleaned = f"col_{cleaned}"
@@ -29,12 +29,42 @@ def _client():
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
 
 
-def _collection(subreddit: str, listing: str):
+def _collection(subreddit: str):
     client = _client()
     return client.get_or_create_collection(
-        name=_collection_name(subreddit, listing),
-        metadata={"hnsw:space": "cosine"},
+        name=_collection_name(subreddit),
+        metadata={"hnsw:space": "cosine", "subreddit": subreddit},
     )
+
+
+def stored_ids(subreddit: str) -> set[str]:
+    collection = _collection(subreddit)
+    count = collection.count()
+    if not count:
+        return set()
+    return set(_as_list(collection.get(limit=count).get("ids")))
+
+
+def embedding_coverage(frame: pd.DataFrame, subreddit: str) -> dict:
+    """How many corpus posts already have embeddings for this subreddit."""
+    if "post_id" not in frame.columns:
+        return {
+            "subreddit": subreddit,
+            "corpus": len(frame),
+            "stored": 0,
+            "missing": len(frame),
+            "collection_total": 0,
+        }
+    ids = frame["post_id"].astype(str).tolist()
+    existing = stored_ids(subreddit)
+    stored = sum(1 for post_id in ids if post_id in existing)
+    return {
+        "subreddit": subreddit,
+        "corpus": len(ids),
+        "stored": stored,
+        "missing": len(ids) - stored,
+        "collection_total": len(existing),
+    }
 
 
 def _meta_scalar(value):
@@ -47,6 +77,14 @@ def _meta_scalar(value):
             return ""
         return value
     return str(value)[:500]
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return list(value)
 
 
 def embeddings_for_posts(
@@ -62,17 +100,18 @@ def embeddings_for_posts(
     if "post_id" not in frame.columns:
         raise RuntimeError("Corpus needs a post_id column for Chroma.")
     ids = frame["post_id"].astype(str).tolist()
-    collection = _collection(subreddit, listing)
-    count = collection.count()
-    existing = set()
-    if count:
-        existing = set(collection.get(limit=count).get("ids") or [])
+    collection = _collection(subreddit)
+    existing = stored_ids(subreddit)
     missing_idx = [i for i, post_id in enumerate(ids) if post_id not in existing]
+    progress(
+        f"Checked r/{subreddit} in ChromaDB: "
+        f"{len(ids) - len(missing_idx)} / {len(ids)} posts already embedded."
+    )
 
     if missing_idx:
         progress(
-            f"Embedding {len(missing_idx)} new posts "
-            f"({len(ids) - len(missing_idx)} already in ChromaDB)…"
+            f"Embedding {len(missing_idx)} new posts for r/{subreddit} "
+            f"and saving them to ChromaDB…"
         )
         texts = (
             frame["selftext"]
@@ -95,6 +134,7 @@ def embeddings_for_posts(
                     {
                         "post_id": ids[i],
                         "title": _meta_scalar(row.get("title")),
+                        "subreddit": subreddit,
                         "listing": listing,
                         "embed_model": embed_model,
                         "embedded_field": "selftext",
@@ -107,12 +147,16 @@ def embeddings_for_posts(
                 metadatas=metas,
             )
     else:
-        progress("Using embeddings already stored in ChromaDB.")
+        progress(f"Using embeddings already stored in ChromaDB for r/{subreddit}.")
 
     fetched = collection.get(ids=ids, include=["embeddings"])
+    fetched_ids = _as_list(fetched.get("ids"))
+    fetched_embs = fetched.get("embeddings")
+    if fetched_embs is None:
+        fetched_embs = []
     by_id = {
         post_id: np.asarray(emb, dtype=np.float64)
-        for post_id, emb in zip(fetched.get("ids") or [], fetched.get("embeddings") or [])
+        for post_id, emb in zip(fetched_ids, fetched_embs)
     }
     missing_after = [i for i, post_id in enumerate(ids) if post_id not in by_id]
     if missing_after:
