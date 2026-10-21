@@ -12,9 +12,21 @@ After a scrape, you choose a sample size *n* (10, 20, 50, or 100). Both methods 
 
 **Cluster centroids** embeds every post, partitions the corpus into *n* clusters, and keeps the post nearest each cluster center. The result is *n* representative posts spread across the semantic space of the subreddit.
 
-**Label coverage** classifies every post for mental status, emotion, and length (small / medium / large `selftext`), then picks *n* posts that cover as many of those label combinations as possible. The result is *n* posts that spread across attributes rather than embedding clusters.
+**Label coverage** (Approach 2) classifies every post for mental status, emotion, and length (small / medium / large `selftext`), then picks *n* posts that cover as many of those label combinations as possible. The result is *n* posts that spread across attributes rather than embedding clusters. **Use this method only on mental-health-related subreddits.** The mental-status model is trained for that domain and is not meant for general subreddits.
 
-Use cluster centroids when you want geometric coverage of topics. Use label coverage when you want spread across clinical/affective labels and post size.
+Use cluster centroids when you want geometric coverage of topics. Use label coverage when the subreddit is mental-health-related and you want spread across clinical/affective labels and post size.
+
+## Communities
+
+**Military branch communities:** [r/army](https://www.reddit.com/r/army/), [r/navy](https://www.reddit.com/r/navy/), [r/AirForce](https://www.reddit.com/r/AirForce/), [r/USMC](https://www.reddit.com/r/USMC/), [r/Military](https://www.reddit.com/r/Military/)
+
+**Veteran communities:** [r/Veterans](https://www.reddit.com/r/Veterans/), [r/VeteransAffairs](https://www.reddit.com/r/VeteransAffairs/), [r/VeteransBenefits](https://www.reddit.com/r/VeteransBenefits/), [r/VeteransWaitingRoom](https://www.reddit.com/r/VeteransWaitingRoom/), [r/VeteransSuccess](https://www.reddit.com/r/VeteransSuccess/)
+
+**Mental health and crisis support:** [r/PTSD](https://www.reddit.com/r/PTSD/), [r/SuicideWatch](https://www.reddit.com/r/SuicideWatch/)
+
+**Combat experiences and stories:** [r/CombatStories](https://www.reddit.com/r/CombatStories/)
+
+Label coverage is intended for the mental-health and crisis-support communities. Cluster centroids can be used on any of these subreddits.
 
 ## Setup
 
@@ -76,7 +88,7 @@ On Windows you can also run `reddit_data_process_ui/run_ui.ps1`.
 In the browser:
 
 1. Enter a subreddit and scrape options, then **Scrape and save**. Posts are written under `data/` as `{subreddit}_{count}_raw.csv`.
-2. Choose *n* and run **Cluster centroids** and/or **Label coverage**.
+2. Choose *n* and run **Cluster centroids** and/or **Label coverage**. Label coverage is only for mental-health-related subreddits.
 3. Compare Vendi scores, save or download the selected posts.
 
 Embeddings are stored in `data/chroma` per subreddit and reused on later runs. Scrapes pause 60 seconds between batches of 100 listing items to stay within Reddit rate limits.
