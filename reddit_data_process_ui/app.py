@@ -629,8 +629,9 @@ with controls:
     )
     listing = st.selectbox(
         "Listing",
-        ["hot", "top", "new"],
+        ["best", "hot", "top", "new"],
         format_func=lambda value: {
+            "best": "Best",
             "hot": "Hot",
             "top": "Top",
             "new": "New (most recent)",

@@ -7,6 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -231,6 +232,12 @@ def save_raw_posts(frame: pd.DataFrame, subreddit: str) -> Path:
 
 def _fetch_listing_batch(sub, listing: str, time_filter: str, limit: int, after: str | None):
     kwargs = {"limit": limit, "params": {"after": after}}
+    if listing == "best":
+        # PRAW exposes .best() on the front page, not on Subreddit.
+        from praw.models.listing.generator import ListingGenerator
+
+        path = getattr(sub, "_path", f"/r/{sub.display_name}/")
+        return list(ListingGenerator(sub._reddit, urljoin(path, "best"), **kwargs))
     if listing == "hot":
         return list(sub.hot(**kwargs))
     if listing == "new":
@@ -309,8 +316,8 @@ def scrape_and_save(
     comments_limit: int = TOP_COMMENTS,
 ) -> dict:
     listing = listing.lower().strip()
-    if listing not in {"hot", "top", "new"}:
-        raise ValueError("Listing must be hot, top, or new.")
+    if listing not in {"best", "hot", "top", "new"}:
+        raise ValueError("Listing must be best, hot, top, or new.")
     total_posts = int(max(1, min(int(total_posts), TOTAL_POSTS)))
     batch_size = int(max(1, min(int(batch_size), total_posts)))
     rate_limit_sleep_s = int(max(0, rate_limit_sleep_s))
