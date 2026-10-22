@@ -168,7 +168,7 @@ def run_approach_1(
 
     ensure_dirs()
     stem = _sample_stem(saved_raw, name, len(frame))
-    a1_path = DATA_DIR / f"{name}_{approach1['k_used']}_a1.csv"
+    a1_path = DATA_DIR / f"{stem}_sample_a1_n{approach1['k_used']}.csv"
     approach1["posts"].to_csv(a1_path, index=False)
     progress(f"Saved cluster centroids sample to data/{a1_path.name}")
 

@@ -297,8 +297,13 @@ def _render_approach_1(result: dict) -> None:
     _vendi_metric(f"{A1_NAME} Vendi", vendi, n, f"Cosine Vendi · {n} centroid posts")
     mean_sim = _as_float(summary.get("mean_sim_approach1"))
     mean_txt = "—" if mean_sim is None else f"{mean_sim:.3f}"
-    save_name = f"{summary['subreddit']}_{n}_a1.csv"
     saved_path = summary.get("sample_a1_file")
+    corpus_n = int(summary.get("n_scraped") or 0)
+    save_name = (
+        Path(saved_path).name
+        if saved_path
+        else f"{summary['subreddit']}_{corpus_n}_sample_a1_n{n}.csv"
+    )
     st.caption(
         f"r/{summary['subreddit']} · {n} centroid posts · mean cosine {mean_txt} · "
         f"embeddings from ChromaDB (`data/chroma`)"
@@ -476,7 +481,7 @@ def _render_results(result: dict) -> None:
         st.download_button(
             f"Download {A1_NAME} CSV",
             data=posts_for_export(posts_a1).to_csv(index=False).encode("utf-8"),
-            file_name=f"r_{summary['subreddit']}_a1_k{summary['k_used']}.csv",
+            file_name=f"{summary['subreddit']}_{n_corpus}_sample_a1_n{n1}.csv",
             mime="text/csv",
             key="dl-a1",
         )
